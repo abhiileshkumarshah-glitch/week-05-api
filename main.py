@@ -89,23 +89,10 @@ def get_db():
 """
 Week 6 Agent Loop Understanding
 
-1. When response.stop_reason == "tool_use":
-   In a Claude-style agent loop, this means the model is not ready to give the final answer yet.
-   Instead, it wants to call one or more tools. The program must read the tool name and tool input,
-   execute the correct Python function, and send the result back to the model.
-
-2. What is tool_use_id and why does it matter?
-   tool_use_id is a unique identifier for a specific tool call. It connects the tool result back
-   to the exact tool request. This matters when the model calls multiple tools because the model
-   needs to know which result belongs to which tool call.
-
-3. Why are tool results added as a "user" role message?
-   Tool results are added back into the conversation as new context. The model then reads the
-   result and decides whether it should call another tool or give the final answer.
-
-4. What would happen without the max_iterations safeguard?
-   Without max_iterations, an agent could get stuck in an infinite loop calling tools again and again.
-   The safeguard stops the loop after a fixed number of steps.
+1. When the model needs a tool, the program must execute the correct Python function.
+2. Tool results are added back into the conversation as a "user" role message.
+3. The model reads those results and decides the next action.
+4. max_iterations prevents the agent from running forever.
 """
 
 
@@ -169,7 +156,9 @@ def update_book(book_id: int, update: BookUpdate, db: Session = Depends(get_db))
         return {"error": "Book not found"}
 
     book.status = update.status
-    book.rating = update.rating
+
+    if update.rating is not None:
+        book.rating = update.rating
 
     db.commit()
     db.refresh(book)
@@ -291,13 +280,13 @@ Keep responses concise — 2-3 recommendations at most unless asked for more."""
 tools = [
     {
         "name": "get_books",
-        "description": "Get all books in the user's book collection. Use this when the user asks what books they have, what they are reading, what they finished, or what is on their want-to-read list. Optional status filter can be reading, read, or want-to-read.",
+        "description": "Get all books in the user's book collection. Optional status filter can be reading, read, or want-to-read.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "status": {
                     "type": "string",
-                    "description": "Optional book status filter. Use reading, read, or want-to-read.",
+                    "description": "Optional status filter: reading, read, or want-to-read.",
                 }
             },
             "required": [],
@@ -305,7 +294,7 @@ tools = [
     },
     {
         "name": "get_book_by_id",
-        "description": "Get one specific book by its numeric id. Use this only when you already know the book id.",
+        "description": "Get one specific book by its numeric id.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -319,62 +308,50 @@ tools = [
     },
     {
         "name": "add_book",
-        "description": "Add a new book to the user's collection. Use this when the user asks to add a book, save a book, or put a book on a reading list.",
+        "description": "Add a new book to the user's collection.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "The title of the book.",
-                },
-                "author": {
-                    "type": "string",
-                    "description": "The author of the book.",
-                },
-                "status": {
-                    "type": "string",
-                    "description": "The reading status. Use reading, read, or want-to-read.",
-                },
-                "rating": {
-                    "type": "integer",
-                    "description": "Optional rating from 1 to 5.",
-                },
+                "title": {"type": "string"},
+                "author": {"type": "string"},
+                "status": {"type": "string"},
+                "rating": {"type": "integer"},
             },
             "required": ["title", "author", "status"],
         },
     },
     {
         "name": "update_book_status",
-        "description": "Update an existing book's status and optional rating. Use this when the user says they started reading, finished reading, wants to mark a book as read, or wants to rate a book. If the id is unknown, first use get_books to find the book.",
+        "description": "Update a book's reading status. Can also include rating.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "book_id": {
-                    "type": "integer",
-                    "description": "The numeric id of the book to update.",
-                },
-                "status": {
-                    "type": "string",
-                    "description": "The new status. Use reading, read, or want-to-read.",
-                },
-                "rating": {
-                    "type": "integer",
-                    "description": "Optional rating from 1 to 5.",
-                },
+                "book_id": {"type": "integer"},
+                "status": {"type": "string"},
+                "rating": {"type": "integer"},
             },
             "required": ["book_id", "status"],
         },
     },
     {
-        "name": "delete_book",
-        "description": "Delete a book from the user's collection. Use this when the user asks to remove or delete a book. If the id is unknown, first use get_books to find the correct book.",
+        "name": "rate_book",
+        "description": "Rate an existing book from 1 to 5. If book id is unknown, use get_books first.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "book_id": {
-                    "type": "integer",
-                    "description": "The numeric id of the book to delete.",
-                }
+                "book_id": {"type": "integer"},
+                "rating": {"type": "integer"},
+            },
+            "required": ["book_id", "rating"],
+        },
+    },
+    {
+        "name": "delete_book",
+        "description": "Delete a book from the collection.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "book_id": {"type": "integer"},
             },
             "required": ["book_id"],
         },
@@ -437,6 +414,22 @@ def update_book_status_fn(
         return {"error": "Book not found"}
 
     book.status = status
+
+    if rating is not None:
+        book.rating = rating
+
+    db.commit()
+    db.refresh(book)
+
+    return book_to_dict(book)
+
+
+def rate_book_fn(db: Session, book_id: int, rating: int) -> dict:
+    book = db.query(Book).filter(Book.id == book_id).first()
+
+    if not book:
+        return {"error": "Book not found"}
+
     book.rating = rating
 
     db.commit()
@@ -464,10 +457,16 @@ def delete_book_fn(db: Session, book_id: int) -> dict:
 
 def execute_tool(tool_name: str, tool_input: dict, db: Session):
     if tool_name == "get_books":
-        return get_books_fn(db, status=tool_input.get("status"))
+        return get_books_fn(
+            db,
+            status=tool_input.get("status"),
+        )
 
     if tool_name == "get_book_by_id":
-        return get_book_by_id_fn(db, book_id=tool_input["book_id"])
+        return get_book_by_id_fn(
+            db,
+            book_id=tool_input["book_id"],
+        )
 
     if tool_name == "add_book":
         return add_book_fn(
@@ -486,8 +485,18 @@ def execute_tool(tool_name: str, tool_input: dict, db: Session):
             rating=tool_input.get("rating"),
         )
 
+    if tool_name == "rate_book":
+        return rate_book_fn(
+            db,
+            book_id=tool_input["book_id"],
+            rating=tool_input["rating"],
+        )
+
     if tool_name == "delete_book":
-        return delete_book_fn(db, book_id=tool_input["book_id"])
+        return delete_book_fn(
+            db,
+            book_id=tool_input["book_id"],
+        )
 
     return {"error": f"Unknown tool: {tool_name}"}
 
@@ -503,9 +512,14 @@ def find_book_by_title(db: Session, title_search: str):
     return None
 
 
-def fallback_agent_plan(user_message: str, db: Session) -> list:
+# ----------------------------
+# Fallback Agent
+# ----------------------------
+
+def fallback_agent_plan(user_message: str, db: Session) -> dict:
     message = user_message.lower()
     tool_calls = []
+    results = []
 
     if "finished" in message and "dune" in message:
         dune_book = find_book_by_title(db, "dune")
@@ -564,111 +578,168 @@ def fallback_agent_plan(user_message: str, db: Session) -> list:
             }
         )
 
-    if "remove" in message and "george orwell" in message:
-        books = db.query(Book).all()
-        for book in books:
-            if "george orwell" in book.author.lower() or "1984" in book.title.lower():
-                tool_calls.append(
-                    {
-                        "tool": "delete_book",
-                        "input": {
-                            "book_id": book.id,
-                        },
-                    }
-                )
-                break
+    if "remove" in message or "delete" in message:
+        if "george orwell" in message or "1984" in message:
+            books = db.query(Book).all()
 
-    return tool_calls
+            for book in books:
+                if "george orwell" in book.author.lower() or "1984" in book.title.lower():
+                    tool_calls.append(
+                        {
+                            "tool": "delete_book",
+                            "input": {
+                                "book_id": book.id,
+                            },
+                        }
+                    )
+                    break
 
+    for call in tool_calls:
+        result = execute_tool(
+            call["tool"],
+            call["input"],
+            db,
+        )
 
-def run_agent(user_message: str, db: Session) -> dict:
-    agent_steps = []
-
-    system_prompt = f"""You are a book collection management agent.
-
-You can use tools to manage the user's book database.
-
-Available tools:
-{json.dumps(tools, indent=2)}
-
-Important rules:
-- You must decide which tool or tools are needed.
-- If the user asks to view books, use get_books.
-- If the user asks to add a book, use add_book.
-- If the user asks to update or finish a book, first use get_books if you do not know the book id, then use update_book_status.
-- If the user asks to delete a book and gives only a title/author clue, first use get_books to find the correct id, then use delete_book.
-- If multiple actions are requested, call multiple tools in order.
-- Use statuses exactly as: reading, read, want-to-read.
-
-Return ONLY valid JSON in this format:
-{{
-  "tool_calls": [
-    {{
-      "tool": "tool_name",
-      "input": {{}}
-    }}
-  ],
-  "final_response": "short message to user after tools are called"
-}}
-"""
-
-    planning_prompt = f"""User request:
-{user_message}
-
-Decide the tool calls needed. Return only JSON."""
-
-    tool_calls = []
-
-    try:
-        if GEMINI_API_KEY:
-            model = genai.GenerativeModel(
-                model_name="gemini-2.5-flash",
-                system_instruction=system_prompt,
-            )
-
-            first_response = model.generate_content(planning_prompt)
-            raw_text = first_response.text.strip()
-
-            if raw_text.startswith("```json"):
-                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-            elif raw_text.startswith("```"):
-                raw_text = raw_text.replace("```", "").strip()
-
-            plan = json.loads(raw_text)
-            tool_calls = plan.get("tool_calls", [])
-        else:
-            tool_calls = fallback_agent_plan(user_message, db)
-
-    except Exception:
-        tool_calls = fallback_agent_plan(user_message, db)
-
-    for tool_call in tool_calls:
-        tool_name = tool_call.get("tool")
-        tool_input = tool_call.get("input", {})
-
-        result = execute_tool(tool_name, tool_input, db)
-
-        agent_steps.append(
+        results.append(
             {
-                "tool": tool_name,
-                "input": tool_input,
+                "tool": call["tool"],
+                "input": call["input"],
                 "result": result,
             }
         )
 
-    final_response = "Done. I completed the requested book actions."
-
-    if agent_steps:
-        final_response += " Tool calls used: "
-        final_response += ", ".join([step["tool"] for step in agent_steps])
-    else:
-        final_response = "I could not determine which book tool to call."
+    if not tool_calls:
+        return {
+            "message": "Fallback could not understand the request.",
+            "tool_calls": [],
+            "results": [],
+        }
 
     return {
-        "response": final_response,
-        "agent_steps": agent_steps,
+        "message": "Fallback agent completed the request.",
+        "tool_calls": tool_calls,
+        "results": results,
     }
-@app.post("/ai/agent")
-def book_agent(request: AgentRequest, db: Session = Depends(get_db)):
-    result = run_agent(request.message, db)
-    return result
+
+
+# ----------------------------
+# Real Iterative Agent Loop
+# ----------------------------
+
+def run_agent(user_message: str, db: Session, max_iterations: int = 5):
+    messages = [
+        {
+            "role": "user",
+            "content": user_message,
+        }
+    ]
+
+    for iteration in range(max_iterations):
+        if not GEMINI_API_KEY:
+            raise Exception("GEMINI_API_KEY is missing.")
+
+        prompt = f"""
+You are a book library AI agent.
+
+You must decide the next step using JSON only.
+
+Available tools:
+1. get_books
+2. get_book_by_id
+3. add_book
+4. update_book_status
+5. rate_book
+6. delete_book
+7. final_answer
+
+Tool descriptions:
+{json.dumps(tools, indent=2)}
+
+Conversation so far:
+{json.dumps(messages, indent=2)}
+
+Return only valid JSON. Do not use markdown.
+
+For a tool call, use:
+{{
+  "tool": "get_books",
+  "input": {{}}
+}}
+
+For final answer, use:
+{{
+  "tool": "final_answer",
+  "input": {{
+    "answer": "your final response"
+  }}
+}}
+
+Rules:
+- Use get_books first if you need to find a book ID.
+- For multi-step requests, do only one tool at a time.
+- After each tool result, continue with the next step.
+- Use final_answer only when the full user request is complete.
+- Valid status values are: reading, read, want-to-read.
+- If user says currently reading, use status "reading".
+- If user says finished a book, update status to "read".
+- If user asks to rate a book, use rate_book or update_book_status with rating.
+"""
+
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content(prompt)
+
+        response_text = response.text.strip()
+        response_text = response_text.replace("```json", "")
+        response_text = response_text.replace("```", "")
+        response_text = response_text.strip()
+
+        try:
+            plan = json.loads(response_text)
+        except Exception:
+            return response.text
+
+        tool_name = plan.get("tool")
+        tool_input = plan.get("input", {})
+
+        if tool_name == "final_answer":
+            return tool_input.get("answer", "Done.")
+
+        result = execute_tool(tool_name, tool_input, db)
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(plan),
+            }
+        )
+
+        # Important TA requirement:
+        # feed tool result back as user role
+        messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "tool_result": result,
+                    }
+                ),
+            }
+        )
+
+    return "Agent stopped because it reached the maximum number of iterations."
+
+
+@app.post("/ai/agent", response_model=str)
+def ai_agent(request: AgentRequest, db: Session = Depends(get_db)):
+    try:
+        result = run_agent(request.message, db)
+
+    except Exception as e:
+        print("Agent failed, using fallback:", e)
+        result = fallback_agent_plan(request.message, db)
+
+    if isinstance(result, dict) or isinstance(result, list):
+        return json.dumps(result, indent=2)
+
+    return str(result)
